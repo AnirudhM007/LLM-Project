@@ -2,19 +2,9 @@ import React, { useState } from 'react';
 
 const App = () => {
   // State variables for document URL, questions input, and response
-  const [documentUrl, setDocumentUrl] = useState('https://hackrx.blob.core.windows.net/assets/policy.pdf?sv=2023-01-03&st=2025-07-04T09%3A11%3A3AZ&se=2025-07-04T09%3A11%3A3AZ&sr=b&sp=r&sig=YOUR_SIGNATURE_HERE');
-  const [questionsInput, setQuestionsInput] = useState(
-    `What is the grace period for premium payment under the National Parivar Mediclaim Plus Policy?
-What is the waiting period for pre-existing diseases (PED) to be covered?
-Does this policy cover maternity expenses, and what are the conditions?
-What is the waiting period for cataract surgery?
-Are the medical expenses for an organ donor covered under this policy?
-What is the No Claim Discount (NCD) offered in this policy?
-Is there a benefit for preventive health check-ups?
-How does the policy define a 'Hospital'?
-What is the extent of coverage for AYUSH treatments?
-Are there any sub-limits on room rent and ICU charges for Plan A?`
-  );
+  // Changed initial state to empty strings for placeholders
+  const [documentUrl, setDocumentUrl] = useState('');
+  const [questionsInput, setQuestionsInput] = useState('');
   const [response, setResponse] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -102,6 +92,8 @@ Are there any sub-limits on room rent and ICU charges for Plan A?`
       <script src="https://cdn.tailwindcss.com"></script>
       {/* Google Fonts link for the 'Inter' font */}
       <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+      {/* Removed the problematic Font Awesome CDN integrity attribute */}
+      <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css" />
 
       {/* Inline style block for the custom font-family */}
       <style>
@@ -130,7 +122,7 @@ Are there any sub-limits on room rent and ICU charges for Plan A?`
             className="shadow-sm appearance-none border rounded-lg w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition duration-200 ease-in-out"
             value={documentUrl} // Binds input value to documentUrl state
             onChange={(e) => setDocumentUrl(e.target.value)} // Updates state on input change
-            placeholder="e.g., https://example.com/document.pdf"
+            placeholder="e.g., https://hackrx.blob.core.windows.net/assets/policy.pdf?sv=2023-01-03&st=2025-07-04T09%3A11%3A3AZ&se=2025-07-04T09%3A11%3A3AZ&sr=b&sp=r&sig=YOUR_SIGNATURE_HERE" // Placeholder text
             aria-label="Document URL"
             disabled={loading} // Disable input when loading
           />
@@ -149,7 +141,7 @@ Are there any sub-limits on room rent and ICU charges for Plan A?`
             className="shadow-sm appearance-none border rounded-lg w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition duration-200 ease-in-out h-48 resize-y"
             value={questionsInput} // Binds textarea value to questionsInput state
             onChange={(e) => setQuestionsInput(e.target.value)} // Updates state on textarea change
-            placeholder="Enter your questions, one per line..."
+            placeholder={`What is the grace period for premium payment under the National Parivar Mediclaim Plus Policy?\nWhat is the waiting period for pre-existing diseases (PED) to be covered?\n...`} // Placeholder text
             aria-label="Questions"
             disabled={loading} // Disable textarea when loading
           ></textarea>
