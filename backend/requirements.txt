@@ -1,15 +1,11 @@
 fastapi
 uvicorn[standard]
-python-dotenv
-requests
-PyPDF2
-python-docx
-google-generativeai
-pinecone # <--- Make sure it's 'pinecone'
-openai
-tiktoken
-langchain
-asyncpg
-PyPDF
-PyPDF
+pydantic
 pydantic-settings
+python-dotenv
+httpx
+google-generativeai
+asyncpg
+pypdf
+pinecone
+

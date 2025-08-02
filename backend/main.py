@@ -4,7 +4,7 @@
 import os
 import httpx
 import asyncpg
-import pypdf
+import pymupdf4llm
 import io
 import google.generativeai as genai
 from pinecone import Pinecone, ServerlessSpec
@@ -18,6 +18,8 @@ import re
 import json
 import asyncio
 import time
+from langchain_text_splitters import MarkdownTextSplitter
+from fastembed import TextEmbedding
 
 # --- Configuration Management ---
 class Settings(BaseSettings):
@@ -45,35 +47,19 @@ class HackRxResponse(BaseModel):
 # --- Service Implementations ---
 
 class GeminiService:
-    """Handles all interactions with the Google Gemini API."""
+    """Handles all interactions with the Google Gemini API for generation."""
     def __init__(self, api_key: str):
         self.api_key = api_key
         genai.configure(api_key=self.api_key)
-        self.embedding_model = "models/embedding-001"
         self.generation_model = genai.GenerativeModel('gemini-1.5-flash-latest')
         print("Gemini Service Initialized.")
-
-    async def get_embeddings(self, texts: List[str], task_type: str) -> List[List[float]]:
-        if not texts: return []
-        print(f"Generating embeddings for {len(texts)} chunks for task: {task_type}...")
-        try:
-            all_embeddings = []
-            for i in range(0, len(texts), 100):
-                batch_texts = texts[i:i+100]
-                result = genai.embed_content(model=self.embedding_model, content=batch_texts, task_type=task_type)
-                all_embeddings.extend(result['embedding'])
-            return all_embeddings
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to generate embeddings: {e}")
 
     async def generate_hypothetical_answer(self, question: str) -> str:
         print(f"Generating hypothetical answer for: '{question}'")
         prompt = f"You are an expert in insurance policies. Based on the user's question, generate a concise, hypothetical answer. This answer will be used to find similar text in a document. Phrase it as a statement. User Question: \"{question}\""
         try:
             response = self.generation_model.generate_content(prompt)
-            hypothetical_answer = response.text.strip()
-            print(f"Generated HyDE: '{hypothetical_answer}'")
-            return hypothetical_answer
+            return response.text.strip()
         except Exception as e:
             print(f"Could not generate hypothetical answer. Error: {e}")
             return question
@@ -87,6 +73,24 @@ class GeminiService:
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to generate an answer: {e}")
 
+class EmbeddingService:
+    """Handles high-speed embedding generation using FastEmbed."""
+    def __init__(self):
+        # BAAI/bge-small-en-v1.5 is a fast and efficient model.
+        self.embedding_model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
+        print("FastEmbed Service Initialized.")
+
+    async def get_embeddings(self, texts: List[str]) -> List[List[float]]:
+        if not texts: return
+        print(f"Generating embeddings for {len(texts)} chunks...")
+        # FastEmbed is synchronous but highly optimized for CPU batch processing.
+        # We run it in a thread to avoid blocking the asyncio event loop.
+        loop = asyncio.get_running_loop()
+        embeddings = await loop.run_in_executor(
+            None, # Use the default ThreadPoolExecutor
+            lambda: list(self.embedding_model.embed(texts))
+        )
+        return embeddings
 
 class PineconeService:
     """Handles all interactions with the Pinecone vector database."""
@@ -95,8 +99,9 @@ class PineconeService:
         self.index_name = index_name
         if self.index_name not in self.pc.list_indexes().names():
             print(f"Creating index '{self.index_name}'...")
+            # Dimension for BAAI/bge-small-en-v1.5 is 384
             self.pc.create_index(
-                name=self.index_name, dimension=768, metric='cosine',
+                name=self.index_name, dimension=384, metric='cosine',
                 spec=ServerlessSpec(cloud='aws', region=environment)
             )
         self.index = self.pc.Index(self.index_name)
@@ -140,46 +145,31 @@ class PostgresService:
 
 # --- Document Processing Utilities ---
 
-async def download_and_parse_pdf(url: str) -> str:
+async def download_and_parse_pdf_to_markdown(url: str) -> str:
     print(f"Downloading and parsing document from: {url}")
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.get(url, follow_redirects=True, timeout=15.0)
+            response = await client.get(url, follow_redirects=True, timeout=12.0)
             response.raise_for_status()
-            pdf_file = io.BytesIO(response.content)
-            reader = pypdf.PdfReader(pdf_file)
-            text = " ".join(page.extract_text() or "" for page in reader.pages)
-            text = re.sub(r'\s+', ' ', text).strip()
-            return text
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=400, detail=f"Failed to download document: {e}")
+            pdf_bytes = response.content
+            # pymupdf4llm is synchronous, so run it in a thread
+            loop = asyncio.get_running_loop()
+            markdown_text = await loop.run_in_executor(
+                None,
+                pymupdf4llm.to_markdown,
+                pdf_bytes
+            )
+            return markdown_text
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to parse PDF: {e}")
-
-def sentence_aware_splitter(text: str, chunk_size: int = 3000) -> List[str]:
-    """
-    Splits text into very large chunks to maximize ingestion speed.
-    """
-    if not text: return []
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-    chunks = []
-    current_chunk = ""
-    for sentence in sentences:
-        if len(current_chunk) + len(sentence) + 1 > chunk_size and current_chunk:
-            chunks.append(current_chunk.strip())
-            current_chunk = ""
-        current_chunk += sentence + " "
-    if current_chunk:
-        chunks.append(current_chunk.strip())
-    return [c for c in chunks if c]
+        raise HTTPException(status_code=500, detail=f"Failed to parse PDF to markdown: {e}")
 
 # --- Core RAG Logic for a Single Question ---
 async def answer_one_question(question: str, document_id: str) -> str:
     """Encapsulates the HyDE logic for answering a single question."""
     hypothetical_answer = await gemini_service.generate_hypothetical_answer(question)
-    hyde_embedding_list = await gemini_service.get_embeddings([hypothetical_answer], task_type="retrieval_query")
-    hyde_embedding = hyde_embedding_list[0]
-    retrieved_chunks = await pinecone_service.query(hyde_embedding, top_k=8, namespace=document_id)
+    hyde_embedding_list = await embedding_service.get_embeddings([hypothetical_answer])
+    hyde_embedding = hyde_embedding_list
+    retrieved_chunks = await pinecone_service.query(hyde_embedding, top_k=7, namespace=document_id)
     if not retrieved_chunks:
         return "Could not find relevant information in the document to answer this question."
     context = "\n\n---\n\n".join(retrieved_chunks)
@@ -191,18 +181,19 @@ app = FastAPI(title="LLM Query Retrieval System", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 gemini_service = GeminiService(api_key=settings.google_api_key)
+embedding_service = EmbeddingService()
 pinecone_service = PineconeService(api_key=settings.pinecone_api_key, environment=settings.pinecone_environment, index_name=settings.pinecone_index_name)
 postgres_service = PostgresService()
 
 async def verify_token(authorization: str = Header(...)):
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid authentication scheme.")
-    if authorization.split(" ")[1] != settings.auth_token:
+    if authorization.split(" ")![1]= settings.auth_token:
         raise HTTPException(status_code=403, detail="Invalid token.")
 
 # --- API Endpoint for Submission ---
 
-@app.post("/api/v1/hackrx/run", response_model=HackRxResponse, dependencies=[Depends(verify_token)])
+@app.post("/api/v1/hackrx/run", response_model=HackRxResponse, dependencies=)
 async def hackrx_run(request: HackRxRequest):
     """
     Handles the entire RAG pipeline in a single, performance-optimized request.
@@ -212,18 +203,20 @@ async def hackrx_run(request: HackRxRequest):
     # --- Step 1: Document Ingestion ---
     try:
         ingestion_start = time.time()
-        document_text = await download_and_parse_pdf(request.documents)
-        if not document_text.strip():
+        markdown_text = await download_and_parse_pdf_to_markdown(request.documents)
+        if not markdown_text.strip():
             raise HTTPException(status_code=500, detail="Extracted text from document is empty.")
         
         document_id = hashlib.sha256(request.documents.encode()).hexdigest()
-        text_chunks = sentence_aware_splitter(document_text)
-        print(f"OPTIMIZATION: Created {len(text_chunks)} chunks from full text.")
+        
+        splitter = MarkdownTextSplitter(chunk_size=2000, chunk_overlap=100)
+        text_chunks = splitter.split_text(markdown_text)
+        print(f"OPTIMIZATION: Created {len(text_chunks)} chunks using MarkdownSplitter.")
         
         if not text_chunks:
             raise HTTPException(status_code=500, detail="Could not extract text chunks from the document.")
             
-        chunk_embeddings = await gemini_service.get_embeddings(text_chunks, task_type="retrieval_document")
+        chunk_embeddings = await embedding_service.get_embeddings(text_chunks)
         await pinecone_service.upsert_documents(text_chunks, chunk_embeddings, namespace=document_id)
         ingestion_time = time.time() - ingestion_start
         print(f"Ingestion completed in {ingestion_time:.2f} seconds.")
