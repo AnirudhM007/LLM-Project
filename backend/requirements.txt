@@ -12,3 +12,4 @@ langchain
 asyncpg
 PyPDF
 PyPDF
+pydantic-settings
