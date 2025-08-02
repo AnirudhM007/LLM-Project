@@ -7,6 +7,7 @@ import requests
 import io
 from PyPDF2 import PdfReader
 from docx import Document
+import json # <--- ADDED: Import the json module for serialization
 
 # --- CORS Middleware for Frontend Communication ---
 from fastapi.middleware.cors import CORSMiddleware
@@ -54,6 +55,12 @@ genai.configure(api_key=GOOGLE_API_KEY)
 gemini_model = genai.GenerativeModel('gemini-2.0-flash') # For text generation
 
 # --- Configure OpenAI Embedding Model ---
+# NOTE: As discussed, your OpenAI free tier is exhausted.
+# This code will still attempt to use OpenAI for embeddings.
+# If you continue to get 429 errors, consider:
+# 1. Adding payment details to your OpenAI account.
+# 2. Switching to Google Gemini embeddings (requires modifying the embedding logic below)
+# 3. Using a local open-source embedding model.
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 embedding_model_client = None
 if OPENAI_API_KEY:
@@ -182,6 +189,7 @@ class IngestResponse(BaseModel):
 # --- Authentication Middleware ---
 @app.middleware("http")
 async def verify_authentication(request: Request, call_next):
+    # Allow OPTIONS requests (pre-flight CORS) and favicon without authentication
     if request.method == "OPTIONS" or request.url.path == "/favicon.ico":
         return await call_next(request)
 
@@ -292,7 +300,6 @@ async def ingest_document_endpoint(request_data: IngestRequest):
         if db_pool:
             try:
                 async with db_pool.acquire() as connection:
-                    # Removed CREATE TABLE IF NOT EXISTS here
                     await connection.execute(
                         """
                         INSERT INTO ingestion_logs (document_url, indexed_chunks, timestamp, status)
@@ -314,7 +321,6 @@ async def ingest_document_endpoint(request_data: IngestRequest):
         if db_pool:
             try:
                 async with db_pool.acquire() as connection:
-                    # Removed CREATE TABLE IF NOT EXISTS here
                     await connection.execute(
                         """
                         INSERT INTO ingestion_logs (document_url, indexed_chunks, timestamp, status)
@@ -386,13 +392,16 @@ async def run_query_retrieval(request_data: QueryRequest):
     if db_pool:
         try:
             async with db_pool.acquire() as connection:
-                # Removed CREATE TABLE IF NOT EXISTS here
+                # Convert lists to JSON strings before inserting into JSONB columns
+                questions_json = json.dumps(questions)
+                answers_json = json.dumps(all_answers)
+
                 await connection.execute(
                     """
                     INSERT INTO query_logs (document_url, questions, answers, timestamp)
                     VALUES ($1, $2, $3, NOW())
                     """,
-                    document_url, questions, all_answers
+                    document_url, questions_json, answers_json # Use the JSON strings here
                 )
                 print("Query and answers logged to PostgreSQL.")
         except Exception as e:
