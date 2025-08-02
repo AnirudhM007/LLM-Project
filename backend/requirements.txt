@@ -11,3 +11,4 @@ tiktoken
 langchain
 asyncpg
 PyPDF
+PyPDF
