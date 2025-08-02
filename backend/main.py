@@ -1,412 +1,259 @@
-from fastapi import FastAPI, HTTPException, Request, status
-from pydantic import BaseModel
-from typing import List, Dict, Any
+# main.py
+# Entry point for the FastAPI-based RAG system, optimized for submission requirements.
+
 import os
-from dotenv import load_dotenv
-import requests
-import io
-from PyPDF2 import PdfReader
-from docx import Document
-import json # <--- ADDED: Import the json module for serialization
-
-# --- CORS Middleware for Frontend Communication ---
-from fastapi.middleware.cors import CORSMiddleware
-
-# --- Gemini API Integration ---
-import google.generativeai as genai
-
-# --- Pinecone Integration ---
-from pinecone import Pinecone, PodSpec, ServerlessSpec
-from openai import OpenAI # Re-import OpenAI for embeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-import uuid
-
-# --- PostgreSQL Integration ---
+import httpx
 import asyncpg
+import pypdf
+import io
+import google.generativeai as genai
+from pinecone import Pinecone, ServerlessSpec
+from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import List, Dict, Optional, Set
+import hashlib
+import re
+import json
+import asyncio
+import time
 
-# Load environment variables from .env file (e.g., API keys, DB credentials)
-load_dotenv()
+# --- Configuration Management ---
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    google_api_key: str
+    pinecone_api_key: str
+    pinecone_environment: str
+    pinecone_index_name: str
+    db_host: str
+    db_name: str
+    db_user: str
+    db_password: str
+    auth_token: str = "5ba298f10582e591e01dd5a437f580a8da1354f64898b2042fc74b9e0968f9d1"
 
-app = FastAPI(
-    title="LLM-Powered Intelligent Query-Retrieval System Backend",
-    version="1.0.0",
-    description="Separated document ingestion and query retrieval processes for improved performance."
-)
+settings = Settings()
 
-# Define allowed origins for CORS. Your React app runs on http://localhost:3000
-origins = [
-    "http://localhost",
-    "http://localhost:3000", # Crucial for your React app to communicate
-]
+# --- API Models for Submission ---
+class HackRxRequest(BaseModel):
+    documents: str = Field(..., description="URL to the PDF document to be processed.")
+    questions: List[str] = Field(..., description="A list of questions to be answered based on the document.")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# --- Configure Gemini API (for Text Generation) ---
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-if not GOOGLE_API_KEY:
-    raise ValueError("GOOGLE_API_KEY environment variable not set. Please set it in your .env file.")
-genai.configure(api_key=GOOGLE_API_KEY)
-gemini_model = genai.GenerativeModel('gemini-2.0-flash') # For text generation
-
-# --- Configure OpenAI Embedding Model ---
-# NOTE: As discussed, your OpenAI free tier is exhausted.
-# This code will still attempt to use OpenAI for embeddings.
-# If you continue to get 429 errors, consider:
-# 1. Adding payment details to your OpenAI account.
-# 2. Switching to Google Gemini embeddings (requires modifying the embedding logic below)
-# 3. Using a local open-source embedding model.
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-embedding_model_client = None
-if OPENAI_API_KEY:
-    embedding_model_client = OpenAI(api_key=OPENAI_API_KEY)
-    print("OpenAI embedding model client initialized.")
-else:
-    print("OPENAI_API_KEY not set. Embedding generation will be disabled.")
-
-
-# --- Configure Pinecone ---
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT")
-PINECONE_INDEX_NAME = "myindex" # Ensure this matches your Pinecone index name
-
-pinecone_client = None
-pinecone_index = None
-if PINECONE_API_KEY and PINECONE_ENVIRONMENT:
-    try:
-        pinecone_client = Pinecone(api_key=PINECONE_API_KEY, environment=PINECONE_ENVIRONMENT)
-
-        # Attempt to create index, but catch ALREADY_EXISTS specifically
-        try:
-            pinecone_client.create_index(
-                name=PINECONE_INDEX_NAME,
-                dimension=1536, # IMPORTANT: Changed dimension back to 1536 for OpenAI's text-embedding-ada-002
-                metric='cosine',
-                spec=ServerlessSpec(cloud='aws', region='us-east-1') # Adjust cloud/region if different
-            )
-            print(f"Pinecone index '{PINECONE_INDEX_NAME}' created successfully.")
-        except Exception as create_e:
-            if "ALREADY_EXISTS" in str(create_e) or "(409)" in str(create_e):
-                print(f"Pinecone index '{PINECONE_INDEX_NAME}' already exists. Connecting to existing index.")
-            else:
-                raise create_e
-
-        pinecone_index = pinecone_client.Index(PINECONE_INDEX_NAME)
-        print(f"Connected to Pinecone index: {PINECONE_INDEX_NAME}")
-    except Exception as e:
-        print(f"Failed to connect to Pinecone: {e}. Pinecone functionality will be disabled.")
-        pinecone_client = None
-        pinecone_index = None
-else:
-    print("Pinecone API key or environment not set. Pinecone functionality will be disabled.")
-
-
-# --- Configure PostgreSQL ---
-DB_HOST = os.getenv("DB_HOST")
-DB_NAME = os.getenv("DB_NAME")
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-
-db_pool = None
-
-@app.on_event("startup")
-async def startup_db_client():
-    global db_pool
-    if DB_HOST and DB_NAME and DB_USER and DB_PASSWORD:
-        try:
-            db_pool = await asyncpg.create_pool(
-                user=DB_USER,
-                password=DB_PASSWORD,
-                host=DB_HOST,
-                database=DB_NAME
-            )
-            print("Connected to PostgreSQL database.")
-            # --- Create query_logs table at startup if it doesn't exist ---
-            async with db_pool.acquire() as connection:
-                await connection.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS query_logs (
-                        id SERIAL PRIMARY KEY,
-                        document_url TEXT NOT NULL,
-                        questions JSONB NOT NULL,
-                        answers JSONB NOT NULL,
-                        timestamp TIMESTAMPTZ DEFAULT NOW()
-                    );
-                    """
-                )
-                print("PostgreSQL 'query_logs' table ensured.")
-
-            # --- Create ingestion_logs table at startup if it doesn't exist ---
-            async with db_pool.acquire() as connection:
-                await connection.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS ingestion_logs (
-                        id SERIAL PRIMARY KEY,
-                        document_url TEXT NOT NULL,
-                        indexed_chunks INT NOT NULL,
-                        timestamp TIMESTAMPTZ DEFAULT NOW(),
-                        status TEXT NOT NULL
-                    );
-                    """
-                )
-                print("PostgreSQL 'ingestion_logs' table ensured.")
-
-        except Exception as e:
-            print(f"Failed to connect to PostgreSQL or create tables: {e}. Database logging will be disabled.")
-            db_pool = None
-    else:
-        print("PostgreSQL credentials not fully set in .env. Database logging will be disabled.")
-
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    if db_pool:
-        await db_pool.close()
-        print("Disconnected from PostgreSQL database.")
-
-
-# --- Pydantic Models for Request/Response Data Validation ---
-class QueryRequest(BaseModel):
-    documents: str
-    questions: List[str]
-
-class QueryResponse(BaseModel):
+class HackRxResponse(BaseModel):
     answers: List[str]
 
-class IngestRequest(BaseModel):
-    document_url: str
+# --- Service Implementations ---
 
-class IngestResponse(BaseModel):
-    message: str
-    status: str
-    indexed_chunks: int = 0
+class GeminiService:
+    """Handles all interactions with the Google Gemini API."""
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        genai.configure(api_key=self.api_key)
+        self.embedding_model = "models/embedding-001"
+        self.generation_model = genai.GenerativeModel('gemini-1.5-flash-latest')
+        print("Gemini Service Initialized.")
 
+    async def get_embeddings(self, texts: List[str], task_type: str) -> List[List[float]]:
+        if not texts: return []
+        print(f"Generating embeddings for {len(texts)} chunks for task: {task_type}...")
+        try:
+            all_embeddings = []
+            for i in range(0, len(texts), 100):
+                batch_texts = texts[i:i+100]
+                result = genai.embed_content(model=self.embedding_model, content=batch_texts, task_type=task_type)
+                all_embeddings.extend(result['embedding'])
+            return all_embeddings
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to generate embeddings: {e}")
 
-# --- Authentication Middleware ---
-@app.middleware("http")
-async def verify_authentication(request: Request, call_next):
-    # Allow OPTIONS requests (pre-flight CORS) and favicon without authentication
-    if request.method == "OPTIONS" or request.url.path == "/favicon.ico":
-        return await call_next(request)
+    async def generate_hypothetical_answer(self, question: str) -> str:
+        print(f"Generating hypothetical answer for: '{question}'")
+        prompt = f"You are an expert in insurance policies. Based on the user's question, generate a concise, hypothetical answer. This answer will be used to find similar text in a document. Phrase it as a statement. User Question: \"{question}\""
+        try:
+            response = self.generation_model.generate_content(prompt)
+            hypothetical_answer = response.text.strip()
+            print(f"Generated HyDE: '{hypothetical_answer}'")
+            return hypothetical_answer
+        except Exception as e:
+            print(f"Could not generate hypothetical answer. Error: {e}")
+            return question
 
-    expected_token = "Bearer 5ba298f10582e591e01dd5a437f580a8da1354f64898b2042fc74b9e0968f9d1"
-    auth_header = request.headers.get("Authorization")
-
-    if auth_header != expected_token:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
-
-    response = await call_next(request)
-    return response
-
-# --- Helper Function for Document Fetching and Parsing ---
-async def fetch_and_parse_document(url: str) -> str:
-    if not url.startswith(('http://', 'https://')):
-        raise ValueError("Invalid URL format. URL must start with http:// or https://")
-
-    try:
-        response = requests.get(url, stream=True, timeout=10)
-        response.raise_for_status()
-
-        content_type = response.headers.get('Content-Type', '').lower()
-        document_content = ""
-
-        if 'application/pdf' in content_type:
-            pdf_file = io.BytesIO(response.content)
-            reader = PdfReader(pdf_file)
-            if len(reader.pages) > 0:
-                for page in reader.pages:
-                    document_content += page.extract_text() + "\n"
-            else:
-                print(f"Warning: PDF at {url} has no readable pages.")
-                document_content = ""
-        elif 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' in content_type:
-            docx_file = io.BytesIO(response.content)
-            document = Document(docx_file)
-            for para in document.paragraphs:
-                document_content += para.text + "\n"
-        elif 'text/plain' in content_type or 'text/html' in content_type:
-            document_content = response.text
-        else:
-            print(f"Warning: Unsupported content type for URL {url}: {content_type}. Attempting to read as plain text.")
-            document_content = response.text
-
-        return document_content.strip()
-
-    except requests.exceptions.Timeout:
-        raise HTTPException(status_code=status.HTTP_408_REQUEST_TIMEOUT, detail=f"Request to document URL timed out: {url}")
-    except requests.exceptions.ConnectionError:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Could not connect to document URL: {url}. Check URL and network.")
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Failed to fetch document from URL '{url}': {e}")
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error parsing document from '{url}': {e}")
+    async def generate_final_answer(self, context: str, question: str) -> str:
+        print(f"Generating final answer for question: '{question}'")
+        prompt = f"CONTEXT:\n---\n{context}\n---\n\nBased exclusively on the CONTEXT provided, answer the following USER QUESTION: {question}. If the answer is not in the context, state 'Cannot answer based on the provided information.'"
+        try:
+            response = self.generation_model.generate_content(prompt)
+            return response.text.strip()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to generate an answer: {e}")
 
 
-# --- NEW Endpoint for Document Ingestion ---
-@app.post("/api/v1/documents/ingest", response_model=IngestResponse)
-async def ingest_document_endpoint(request_data: IngestRequest):
-    global pinecone_index, embedding_model_client, db_pool
-
-    document_url = request_data.document_url
-
-    if not pinecone_index or not embedding_model_client:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Pinecone or Embedding model not configured/active. Cannot ingest documents."
-        )
-
-    try:
-        document_content = await fetch_and_parse_document(document_url)
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error fetching/parsing document for ingestion: {e}")
-
-    if not document_content.strip():
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Document content could not be retrieved or was empty after parsing. Cannot ingest.")
-
-    indexed_chunks_count = 0
-    try:
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        chunks = text_splitter.split_text(document_content)
-
-        vectors_to_upsert = []
-        for i, chunk in enumerate(chunks):
-            chunk_id = f"{document_url.replace('.', '_').replace('/', '_').replace(':', '_')}_{i}_{uuid.uuid4().hex[:8]}"
-            # Use OpenAI's embedding model
-            embedding_response = embedding_model_client.embeddings.create(
-                input=[chunk],
-                model="text-embedding-ada-002" # Using OpenAI's embedding model
+class PineconeService:
+    """Handles all interactions with the Pinecone vector database."""
+    def __init__(self, api_key: str, environment: str, index_name: str):
+        self.pc = Pinecone(api_key=api_key)
+        self.index_name = index_name
+        if self.index_name not in self.pc.list_indexes().names():
+            print(f"Creating index '{self.index_name}'...")
+            self.pc.create_index(
+                name=self.index_name, dimension=768, metric='cosine',
+                spec=ServerlessSpec(cloud='aws', region=environment)
             )
-            embedding = embedding_response.data[0].embedding
+        self.index = self.pc.Index(self.index_name)
+        print("Pinecone Service Initialized.")
 
-            vectors_to_upsert.append({
-                "id": chunk_id,
-                "values": embedding,
-                "metadata": {"text": chunk, "source_url": document_url, "chunk_index": i}
-            })
-        
-        if vectors_to_upsert:
-            pinecone_index.upsert(vectors=vectors_to_upsert)
-            indexed_chunks_count = len(vectors_to_upsert)
-            print(f"Successfully ingested {indexed_chunks_count} chunks to Pinecone for {document_url}.")
+    async def upsert_documents(self, chunks: List[str], embeddings: List[List[float]], namespace: str):
+        if not chunks or not embeddings: return
+        print(f"Upserting {len(chunks)} documents into Pinecone namespace: {namespace}")
+        vectors = [{"id": f"chunk_{i}", "values": emb, "metadata": {"text": chunk}} for i, (chunk, emb) in enumerate(zip(chunks, embeddings))]
+        for i in range(0, len(vectors), 100):
+            batch = vectors[i:i+100]
+            self.index.upsert(vectors=batch, namespace=namespace)
+        print("Upsert complete.")
 
-        if db_pool:
+    async def query(self, query_embedding: List[float], top_k: int, namespace: str) -> List[str]:
+        print(f"Querying Pinecone namespace '{namespace}'...")
+        result = self.index.query(namespace=namespace, vector=query_embedding, top_k=top_k, include_metadata=True)
+        return [match['metadata']['text'] for match in result['matches']]
+
+
+class PostgresService:
+    """Handles interactions with the PostgreSQL database for logging."""
+    _pool: Optional[asyncpg.Pool] = None
+
+    async def get_pool(self) -> asyncpg.Pool:
+        if self._pool is None:
+            print("Initializing PostgreSQL connection pool...")
             try:
-                async with db_pool.acquire() as connection:
-                    await connection.execute(
-                        """
-                        INSERT INTO ingestion_logs (document_url, indexed_chunks, timestamp, status)
-                        VALUES ($1, $2, NOW(), $3)
-                        """,
-                        document_url, indexed_chunks_count, "SUCCESS"
-                    )
-                    print(f"Ingestion for {document_url} logged to PostgreSQL.")
+                self._pool = await asyncpg.create_pool(host=settings.db_host, database=settings.db_name, user=settings.db_user, password=settings.db_password)
             except Exception as e:
-                print(f"Error logging ingestion to PostgreSQL for {document_url}: {e}")
-        
-        return IngestResponse(
-            message=f"Document '{document_url}' ingested successfully.",
-            status="success",
-            indexed_chunks=indexed_chunks_count
-        )
+                print(f"Failed to connect to or initialize PostgreSQL: {e}")
+                raise
+        return self._pool
 
+    async def log_interaction(self, document_url: str, questions: List[str], answers: List[str]):
+        print("Logging interaction to PostgreSQL...")
+        pool = await self.get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("CREATE TABLE IF NOT EXISTS hackrx_run_logs (id SERIAL PRIMARY KEY, document_url TEXT, questions TEXT, answers TEXT, created_at TIMESTAMPTZ DEFAULT NOW());")
+            await conn.execute("INSERT INTO hackrx_run_logs (document_url, questions, answers) VALUES ($1, $2, $3)", document_url, str(questions), str(answers))
+
+# --- Document Processing Utilities ---
+
+async def download_and_parse_pdf(url: str) -> str:
+    print(f"Downloading and parsing document from: {url}")
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, follow_redirects=True, timeout=15.0)
+            response.raise_for_status()
+            pdf_file = io.BytesIO(response.content)
+            reader = pypdf.PdfReader(pdf_file)
+            text = " ".join(page.extract_text() or "" for page in reader.pages)
+            text = re.sub(r'\s+', ' ', text).strip()
+            return text
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=400, detail=f"Failed to download document: {e}")
     except Exception as e:
-        if db_pool:
-            try:
-                async with db_pool.acquire() as connection:
-                    await connection.execute(
-                        """
-                        INSERT INTO ingestion_logs (document_url, indexed_chunks, timestamp, status)
-                        VALUES ($1, $2, NOW(), $3)
-                        """,
-                        document_url, 0, f"FAILED: {e}"
-                    )
-            except Exception as db_e:
-                print(f"Critical: Failed to log ingestion error to DB: {db_e}")
+        raise HTTPException(status_code=500, detail=f"Failed to parse PDF: {e}")
 
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to ingest document '{document_url}': {e}")
+def sentence_aware_splitter(text: str, chunk_size: int = 3000) -> List[str]:
+    """
+    Splits text into very large chunks to maximize ingestion speed.
+    """
+    if not text: return []
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    chunks = []
+    current_chunk = ""
+    for sentence in sentences:
+        if len(current_chunk) + len(sentence) + 1 > chunk_size and current_chunk:
+            chunks.append(current_chunk.strip())
+            current_chunk = ""
+        current_chunk += sentence + " "
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+    return [c for c in chunks if c]
 
+# --- Core RAG Logic for a Single Question ---
+async def answer_one_question(question: str, document_id: str) -> str:
+    """Encapsulates the HyDE logic for answering a single question."""
+    hypothetical_answer = await gemini_service.generate_hypothetical_answer(question)
+    hyde_embedding_list = await gemini_service.get_embeddings([hypothetical_answer], task_type="retrieval_query")
+    hyde_embedding = hyde_embedding_list[0]
+    retrieved_chunks = await pinecone_service.query(hyde_embedding, top_k=8, namespace=document_id)
+    if not retrieved_chunks:
+        return "Could not find relevant information in the document to answer this question."
+    context = "\n\n---\n\n".join(retrieved_chunks)
+    return await gemini_service.generate_final_answer(context, question)
 
-# --- MODIFIED Endpoint for Query Retrieval ---
-@app.post("/api/v1/hackrx/run", response_model=QueryResponse)
-async def run_query_retrieval(request_data: QueryRequest):
-    global pinecone_index, embedding_model_client
+# --- FastAPI Application Setup ---
 
-    document_url = request_data.documents
-    questions = request_data.questions
+app = FastAPI(title="LLM Query Retrieval System", version="1.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-    all_answers = []
+gemini_service = GeminiService(api_key=settings.google_api_key)
+pinecone_service = PineconeService(api_key=settings.pinecone_api_key, environment=settings.pinecone_environment, index_name=settings.pinecone_index_name)
+postgres_service = PostgresService()
 
-    for question in questions:
-        context = ""
+async def verify_token(authorization: str = Header(...)):
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authentication scheme.")
+    if authorization.split(" ")[1] != settings.auth_token:
+        raise HTTPException(status_code=403, detail="Invalid token.")
+
+# --- API Endpoint for Submission ---
+
+@app.post("/api/v1/hackrx/run", response_model=HackRxResponse, dependencies=[Depends(verify_token)])
+async def hackrx_run(request: HackRxRequest):
+    """
+    Handles the entire RAG pipeline in a single, performance-optimized request.
+    """
+    start_time = time.time()
+
+    # --- Step 1: Document Ingestion ---
+    try:
+        ingestion_start = time.time()
+        document_text = await download_and_parse_pdf(request.documents)
+        if not document_text.strip():
+            raise HTTPException(status_code=500, detail="Extracted text from document is empty.")
         
-        if pinecone_index and embedding_model_client:
-            try:
-                # Create embedding for the question
-                embedding_response = embedding_model_client.embeddings.create(
-                    input=[question],
-                    model="text-embedding-ada-002" # Using OpenAI's embedding model
-                )
-                query_embedding = embedding_response.data[0].embedding
+        document_id = hashlib.sha256(request.documents.encode()).hexdigest()
+        text_chunks = sentence_aware_splitter(document_text)
+        print(f"OPTIMIZATION: Created {len(text_chunks)} chunks from full text.")
+        
+        if not text_chunks:
+            raise HTTPException(status_code=500, detail="Could not extract text chunks from the document.")
+            
+        chunk_embeddings = await gemini_service.get_embeddings(text_chunks, task_type="retrieval_document")
+        await pinecone_service.upsert_documents(text_chunks, chunk_embeddings, namespace=document_id)
+        ingestion_time = time.time() - ingestion_start
+        print(f"Ingestion completed in {ingestion_time:.2f} seconds.")
+    except Exception as e:
+        print(f"Error during ingestion phase: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed during document ingestion: {e}")
 
-                # Query Pinecone for relevant chunks
-                results = pinecone_index.query(
-                    vector=query_embedding,
-                    top_k=5,
-                    include_metadata=True,
-                )
-                relevant_texts = [match.metadata['text'] for match in results.matches]
-                
-                if relevant_texts:
-                    context = "\n\n".join(relevant_texts)
-                    print(f"Retrieved {len(relevant_texts)} relevant chunks from Pinecone for '{question}'.")
-                else:
-                    print(f"No relevant chunks found in Pinecone for '{question}'.")
-            except Exception as e:
-                print(f"Error during Pinecone semantic search for question '{question}': {e}. Proceeding with empty context.")
-                context = ""
-        else:
-            print("Pinecone or embedding model not active. Proceeding with empty context for LLM.")
-            context = ""
+    # --- Step 2: Concurrent Question Answering ---
+    answering_start = time.time()
+    try:
+        tasks = [answer_one_question(q, document_id) for q in request.questions]
+        answers = await asyncio.gather(*tasks)
+    except Exception as e:
+        print(f"Error during answering phase: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed during question answering: {e}")
+    
+    answering_time = time.time() - answering_start
+    print(f"Answering completed in {answering_time:.2f} seconds.")
+    
+    # --- Step 3: Logging and Response ---
+    await postgres_service.log_interaction(request.documents, request.questions, answers)
+    
+    total_time = time.time() - start_time
+    print(f"Full request completed in {total_time:.2f} seconds.")
 
-        try:
-            llm_prompt = f"Given the following document content (if any):\n\n---\n{context}\n---\n\nAnswer the following question based ONLY on the provided document content. If the information is not in the document, state that it's not found.\n\nQuestion: {question}\n\nAnswer:"
+    if total_time > 30:
+        print(f"WARNING: Request took {total_time:.2f} seconds, which exceeds the 30s timeout.")
 
-            response = await gemini_model.generate_content_async(llm_prompt)
-            answer = response.text.strip()
+    return HackRxResponse(answers=answers)
 
-            all_answers.append(answer)
-        except Exception as e:
-            print(f"Error processing question with Gemini API: {e}")
-            all_answers.append(f"Error retrieving answer for: {question}. (LLM processing failed)")
-
-    response_data = QueryResponse(answers=all_answers)
-
-    if db_pool:
-        try:
-            async with db_pool.acquire() as connection:
-                # Convert lists to JSON strings before inserting into JSONB columns
-                questions_json = json.dumps(questions)
-                answers_json = json.dumps(all_answers)
-
-                await connection.execute(
-                    """
-                    INSERT INTO query_logs (document_url, questions, answers, timestamp)
-                    VALUES ($1, $2, $3, NOW())
-                    """,
-                    document_url, questions_json, answers_json # Use the JSON strings here
-                )
-                print("Query and answers logged to PostgreSQL.")
-        except Exception as e:
-            print(f"Error logging query to PostgreSQL: {e}")
-    else:
-        print("PostgreSQL connection not active. Skipping database logging.")
-
-    return response_data
+@app.get("/health", status_code=200)
+def health_check():
+    return {"status": "ok"}
