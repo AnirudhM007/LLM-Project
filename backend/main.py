@@ -66,17 +66,33 @@ class GeminiService:
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to generate embeddings: {e}")
 
-    async def generate_hypothetical_answer(self, question: str) -> str:
-        print(f"Generating hypothetical answer for: '{question}'")
-        prompt = f"You are an expert in insurance policies. Based on the user's question, generate a concise, hypothetical answer. This answer will be used to find similar text in a document. Phrase it as a statement. User Question: \"{question}\""
+    async def generate_batch_hypothetical_answers(self, questions: List[str]) -> List[str]:
+        """Generates a batch of hypothetical answers from a list of questions in a single API call."""
+        print(f"Generating batch of hypothetical answers for {len(questions)} questions...")
+        
+        formatted_questions = "\n".join([f"Q{i+1}: {q}" for i, q in enumerate(questions)])
+        
+        prompt = f"""
+        You are an expert in insurance policies. Based on the user's list of questions, generate a concise, hypothetical answer for each one.
+        These answers will be used to find similar text in a document. Phrase them as statements.
+        Return the result as a JSON object where the keys are the question numbers (e.g., "A1", "A2") and the values are the hypothetical answers.
+
+        User Questions:
+        {formatted_questions}
+
+        JSON Output:
+        """
         try:
             response = self.generation_model.generate_content(prompt)
-            hypothetical_answer = response.text.strip()
-            print(f"Generated HyDE: '{hypothetical_answer}'")
-            return hypothetical_answer
+            cleaned_response = response.text.strip().replace("```json", "").replace("```", "").strip()
+            answers_dict = json.loads(cleaned_response)
+            # Ensure the order is correct
+            hypothetical_answers = [answers_dict.get(f"A{i+1}", q) for i, q in enumerate(questions)]
+            print(f"Generated {len(hypothetical_answers)} HyDEs in a batch.")
+            return hypothetical_answers
         except Exception as e:
-            print(f"Could not generate hypothetical answer. Error: {e}")
-            return question
+            print(f"Could not generate batch hypothetical answers. Error: {e}")
+            return questions # Fallback to using the original questions
 
     async def generate_final_answer(self, context: str, question: str) -> str:
         print(f"Generating final answer for question: '{question}'")
@@ -122,7 +138,7 @@ class PostgresService:
     _pool: Optional[asyncpg.Pool] = None
 
     async def get_pool(self) -> asyncpg.Pool:
-        if self._pool is None:
+        if self._pool is None or self._pool._closed:
             print("Initializing PostgreSQL connection pool...")
             try:
                 self._pool = await asyncpg.create_pool(host=settings.db_host, database=settings.db_name, user=settings.db_user, password=settings.db_password)
@@ -133,24 +149,24 @@ class PostgresService:
 
     async def log_interaction(self, document_url: str, questions: List[str], answers: List[str]):
         print("Logging interaction to PostgreSQL...")
-        pool = await self.get_pool()
-        async with pool.acquire() as conn:
-            # Simple logging for the batch request
-            await conn.execute("CREATE TABLE IF NOT EXISTS hackrx_run_logs (id SERIAL PRIMARY KEY, document_url TEXT, questions TEXT, answers TEXT, created_at TIMESTAMPTZ DEFAULT NOW());")
-            await conn.execute("INSERT INTO hackrx_run_logs (document_url, questions, answers) VALUES ($1, $2, $3)", document_url, str(questions), str(answers))
+        try:
+            pool = await self.get_pool()
+            async with pool.acquire() as conn:
+                await conn.execute("CREATE TABLE IF NOT EXISTS hackrx_run_logs (id SERIAL PRIMARY KEY, document_url TEXT, questions TEXT, answers TEXT, created_at TIMESTAMPTZ DEFAULT NOW());")
+                await conn.execute("INSERT INTO hackrx_run_logs (document_url, questions, answers) VALUES ($1, $2, $3)", document_url, str(questions), str(answers))
+        except Exception as e:
+            print(f"WARNING: Failed to log interaction to PostgreSQL. Error: {e}")
 
 # --- Document Processing Utilities ---
 
 async def download_and_parse_pdf(url: str) -> str:
     print(f"Downloading and parsing document from: {url}")
     try:
-        # OPTIMIZATION: Aggressive timeout for the download
         async with httpx.AsyncClient() as client:
             response = await client.get(url, follow_redirects=True, timeout=12.0)
             response.raise_for_status()
             pdf_file = io.BytesIO(response.content)
             reader = pypdf.PdfReader(pdf_file)
-            # OPTIMIZATION: More efficient text extraction and cleaning
             text = " ".join(page.extract_text() or "" for page in reader.pages)
             text = re.sub(r'\s+', ' ', text).strip()
             return text
@@ -160,9 +176,6 @@ async def download_and_parse_pdf(url: str) -> str:
         raise HTTPException(status_code=500, detail=f"Failed to parse PDF: {e}")
 
 def sentence_aware_splitter(text: str, chunk_size: int = 4000) -> List[str]:
-    """
-    Splits text into larger chunks to speed up ingestion by reducing the number of chunks.
-    """
     if not text: return []
     sentences = re.split(r'(?<=[.!?])\s+', text)
     chunks = []
@@ -174,19 +187,15 @@ def sentence_aware_splitter(text: str, chunk_size: int = 4000) -> List[str]:
         current_chunk += sentence + " "
     if current_chunk:
         chunks.append(current_chunk.strip())
-    return [c for c in chunks if c] # Ensure no empty chunks
+    return [c for c in chunks if c]
 
-# --- Core RAG Logic for a Single Question ---
-async def answer_one_question(question: str, document_id: str) -> str:
-    """Encapsulates the HyDE logic for answering a single question."""
-    hypothetical_answer = await gemini_service.generate_hypothetical_answer(question)
-    hyde_embedding_list = await gemini_service.get_embeddings([hypothetical_answer], task_type="retrieval_query")
-    hyde_embedding = hyde_embedding_list[0]
-    retrieved_chunks = await pinecone_service.query(hyde_embedding, top_k=6, namespace=document_id) # OPTIMIZATION: Reduced top_k
+# --- Core RAG Logic ---
+async def generate_context_for_question(hyde_embedding: List[float], document_id: str) -> str:
+    """Retrieves and combines context for a single question."""
+    retrieved_chunks = await pinecone_service.query(hyde_embedding, top_k=6, namespace=document_id)
     if not retrieved_chunks:
-        return "Could not find relevant information in the document to answer this question."
-    context = "\n\n---\n\n".join(retrieved_chunks)
-    return await gemini_service.generate_final_answer(context, question)
+        return ""
+    return "\n\n---\n\n".join(retrieved_chunks)
 
 # --- FastAPI Application Setup ---
 
@@ -200,7 +209,6 @@ postgres_service = PostgresService()
 async def verify_token(authorization: str = Header(...)):
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid authentication scheme.")
-    # FIX: Corrected the syntax from `![1]=` to `[1] !=`
     if authorization.split(" ")[1] != settings.auth_token:
         raise HTTPException(status_code=403, detail="Invalid token.")
 
@@ -235,11 +243,32 @@ async def hackrx_run(request: HackRxRequest):
         print(f"Error during ingestion phase: {e}")
         raise HTTPException(status_code=500, detail=f"Failed during document ingestion: {e}")
 
-    # --- Step 2: Concurrent Question Answering ---
+    # --- Step 2: Batch-Optimized Question Answering ---
     answering_start = time.time()
     try:
-        tasks = [answer_one_question(q, document_id) for q in request.questions]
-        answers = await asyncio.gather(*tasks)
+        # Step 2a: Generate all hypothetical answers in one batch
+        hypothetical_answers = await gemini_service.generate_batch_hypothetical_answers(request.questions)
+        
+        # Step 2b: Embed all hypothetical answers in one batch
+        hyde_embeddings = await gemini_service.get_embeddings(hypothetical_answers, task_type="retrieval_query")
+        
+        # Step 2c: Retrieve context for all questions concurrently
+        context_tasks = [generate_context_for_question(emb, document_id) for emb in hyde_embeddings]
+        contexts = await asyncio.gather(*context_tasks)
+        
+        # Step 2d: Generate final answers for all questions concurrently
+        answer_tasks = []
+        for i, context in enumerate(contexts):
+            if not context:
+                # If no context was found, create a task that just returns the failure message
+                async def no_answer_task():
+                    return "Could not find relevant information in the document to answer this question."
+                answer_tasks.append(no_answer_task())
+            else:
+                answer_tasks.append(gemini_service.generate_final_answer(context, request.questions[i]))
+        
+        answers = await asyncio.gather(*answer_tasks)
+
     except Exception as e:
         print(f"Error during answering phase: {e}")
         raise HTTPException(status_code=500, detail=f"Failed during question answering: {e}")
