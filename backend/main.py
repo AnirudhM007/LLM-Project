@@ -86,22 +86,44 @@ class GeminiService:
             response = self.generation_model.generate_content(prompt)
             cleaned_response = response.text.strip().replace("```json", "").replace("```", "").strip()
             answers_dict = json.loads(cleaned_response)
-            # Ensure the order is correct
             hypothetical_answers = [answers_dict.get(f"A{i+1}", q) for i, q in enumerate(questions)]
             print(f"Generated {len(hypothetical_answers)} HyDEs in a batch.")
             return hypothetical_answers
         except Exception as e:
             print(f"Could not generate batch hypothetical answers. Error: {e}")
-            return questions # Fallback to using the original questions
+            return questions
 
-    async def generate_final_answer(self, context: str, question: str) -> str:
-        print(f"Generating final answer for question: '{question}'")
-        prompt = f"CONTEXT:\n---\n{context}\n---\n\nBased exclusively on the CONTEXT provided, answer the following USER QUESTION: {question}. If the answer is not in the context, state 'Cannot answer based on the provided information.'"
+    async def generate_batch_final_answers(self, contexts: List[str], questions: List[str]) -> List[str]:
+        """Generates the final, factual answers for a batch of questions in a single API call."""
+        print(f"Generating batch of final answers for {len(questions)} questions...")
+
+        combined_input = ""
+        for i, (question, context) in enumerate(zip(questions, contexts)):
+            combined_input += f"**Question {i+1}:** {question}\n"
+            combined_input += f"**Context for Q{i+1}:**\n---\n{context if context else 'No context found.'}\n---\n\n"
+
+        prompt = f"""
+        You are a specialized assistant for analyzing insurance policy documents. Your goal is to provide precise answers to a list of user questions based *exclusively* on the text provided for each question in the 'CONTEXT' section.
+
+        {combined_input}
+
+        **Instructions:**
+        - For each question, thoroughly scan its corresponding CONTEXT to locate the answer.
+        - Synthesize the information into a clear and concise answer for each question.
+        - If the context for a specific question does not contain the necessary information, you MUST respond with "Cannot answer based on the provided information." for that question.
+        - Return the result as a single JSON object where the keys are the answer numbers (e.g., "A1", "A2") and the values are the final answers.
+
+        **JSON Output:**
+        """
         try:
             response = self.generation_model.generate_content(prompt)
-            return response.text.strip()
+            cleaned_response = response.text.strip().replace("```json", "").replace("```", "").strip()
+            answers_dict = json.loads(cleaned_response)
+            final_answers = [answers_dict.get(f"A{i+1}", "Failed to generate an answer.") for i in range(len(questions))]
+            return final_answers
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to generate an answer: {e}")
+            print(f"Could not generate batch final answers. Error: {e}")
+            return ["Failed to generate an answer due to an error." for _ in questions]
 
 
 class PineconeService:
@@ -175,7 +197,7 @@ async def download_and_parse_pdf(url: str) -> str:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to parse PDF: {e}")
 
-def sentence_aware_splitter(text: str, chunk_size: int = 4000) -> List[str]:
+def sentence_aware_splitter(text: str, chunk_size: int = 3000) -> List[str]:
     if not text: return []
     sentences = re.split(r'(?<=[.!?])\s+', text)
     chunks = []
@@ -256,18 +278,8 @@ async def hackrx_run(request: HackRxRequest):
         context_tasks = [generate_context_for_question(emb, document_id) for emb in hyde_embeddings]
         contexts = await asyncio.gather(*context_tasks)
         
-        # Step 2d: Generate final answers for all questions concurrently
-        answer_tasks = []
-        for i, context in enumerate(contexts):
-            if not context:
-                # If no context was found, create a task that just returns the failure message
-                async def no_answer_task():
-                    return "Could not find relevant information in the document to answer this question."
-                answer_tasks.append(no_answer_task())
-            else:
-                answer_tasks.append(gemini_service.generate_final_answer(context, request.questions[i]))
-        
-        answers = await asyncio.gather(*answer_tasks)
+        # Step 2d: Generate all final answers in a single batch call
+        answers = await gemini_service.generate_batch_final_answers(contexts, request.questions)
 
     except Exception as e:
         print(f"Error during answering phase: {e}")
