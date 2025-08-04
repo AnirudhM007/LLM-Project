@@ -1,5 +1,5 @@
 # main.py
-# Entry point for the FastAPI-based RAG system, optimized for submission requirements.
+# Entry point for the FastAPI-based RAG system, with Redis caching for performance.
 
 import os
 import httpx
@@ -12,12 +12,13 @@ from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import List, Dict, Optional, Set
+from typing import List, Dict, Optional
 import hashlib
 import re
 import json
 import asyncio
 import time
+import redis.asyncio as redis
 
 # --- Configuration Management ---
 class Settings(BaseSettings):
@@ -30,6 +31,9 @@ class Settings(BaseSettings):
     db_name: str
     db_user: str
     db_password: str
+    # Add REDIS_URL to your .env file. For local dev, it can be "redis://localhost"
+    # For Render, you'll create a Redis instance and get a URL from them.
+    redis_url: str = "redis://localhost"
     auth_token: str = "5ba298f10582e591e01dd5a437f580a8da1354f64898b2042fc74b9e0968f9d1"
 
 settings = Settings()
@@ -67,21 +71,9 @@ class GeminiService:
             raise HTTPException(status_code=500, detail=f"Failed to generate embeddings: {e}")
 
     async def generate_batch_hypothetical_answers(self, questions: List[str]) -> List[str]:
-        """Generates a batch of hypothetical answers from a list of questions in a single API call."""
         print(f"Generating batch of hypothetical answers for {len(questions)} questions...")
-        
         formatted_questions = "\n".join([f"Q{i+1}: {q}" for i, q in enumerate(questions)])
-        
-        prompt = f"""
-        You are an expert in insurance policies. Based on the user's list of questions, generate a concise, hypothetical answer for each one.
-        These answers will be used to find similar text in a document. Phrase them as statements.
-        Return the result as a JSON object where the keys are the question numbers (e.g., "A1", "A2") and the values are the hypothetical answers.
-
-        User Questions:
-        {formatted_questions}
-
-        JSON Output:
-        """
+        prompt = f"You are an expert in insurance policies. Based on the user's list of questions, generate a concise, hypothetical answer for each one. Return the result as a JSON object where keys are 'A1', 'A2', etc. User Questions:\n{formatted_questions}\n\nJSON Output:"
         try:
             response = self.generation_model.generate_content(prompt)
             cleaned_response = response.text.strip().replace("```json", "").replace("```", "").strip()
@@ -94,27 +86,11 @@ class GeminiService:
             return questions
 
     async def generate_batch_final_answers(self, contexts: List[str], questions: List[str]) -> List[str]:
-        """Generates the final, factual answers for a batch of questions in a single API call."""
         print(f"Generating batch of final answers for {len(questions)} questions...")
-
         combined_input = ""
         for i, (question, context) in enumerate(zip(questions, contexts)):
-            combined_input += f"**Question {i+1}:** {question}\n"
-            combined_input += f"**Context for Q{i+1}:**\n---\n{context if context else 'No context found.'}\n---\n\n"
-
-        prompt = f"""
-        You are a specialized assistant for analyzing insurance policy documents. Your goal is to provide precise answers to a list of user questions based *exclusively* on the text provided for each question in the 'CONTEXT' section.
-
-        {combined_input}
-
-        **Instructions:**
-        - For each question, thoroughly scan its corresponding CONTEXT to locate the answer.
-        - Synthesize the information into a clear and concise answer for each question.
-        - If the context for a specific question does not contain the necessary information, you MUST respond with "Cannot answer based on the provided information." for that question.
-        - Return the result as a single JSON object where the keys are the answer numbers (e.g., "A1", "A2") and the values are the final answers.
-
-        **JSON Output:**
-        """
+            combined_input += f"**Question {i+1}:** {question}\n**Context for Q{i+1}:**\n---\n{context if context else 'No context found.'}\n---\n\n"
+        prompt = f"You are a specialized assistant. Answer a list of user questions based *exclusively* on the text provided for each question in the 'CONTEXT' section. If the context for a question is insufficient, you MUST respond with 'Cannot answer based on the provided information.' for that specific question. Return a single JSON object with keys 'A1', 'A2', etc. \n\n{combined_input}\n\nJSON Output:"
         try:
             response = self.generation_model.generate_content(prompt)
             cleaned_response = response.text.strip().replace("```json", "").replace("```", "").strip()
@@ -133,10 +109,7 @@ class PineconeService:
         self.index_name = index_name
         if self.index_name not in self.pc.list_indexes().names():
             print(f"Creating index '{self.index_name}'...")
-            self.pc.create_index(
-                name=self.index_name, dimension=768, metric='cosine',
-                spec=ServerlessSpec(cloud='aws', region=environment)
-            )
+            self.pc.create_index(name=self.index_name, dimension=768, metric='cosine', spec=ServerlessSpec(cloud='aws', region=environment))
         self.index = self.pc.Index(self.index_name)
         print("Pinecone Service Initialized.")
 
@@ -192,10 +165,8 @@ async def download_and_parse_pdf(url: str) -> str:
             text = " ".join(page.extract_text() or "" for page in reader.pages)
             text = re.sub(r'\s+', ' ', text).strip()
             return text
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=400, detail=f"Failed to download document: {e}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to parse PDF: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to download document: {e}")
 
 def sentence_aware_splitter(text: str, chunk_size: int = 3000) -> List[str]:
     if not text: return []
@@ -213,10 +184,8 @@ def sentence_aware_splitter(text: str, chunk_size: int = 3000) -> List[str]:
 
 # --- Core RAG Logic ---
 async def generate_context_for_question(hyde_embedding: List[float], document_id: str) -> str:
-    """Retrieves and combines context for a single question."""
     retrieved_chunks = await pinecone_service.query(hyde_embedding, top_k=6, namespace=document_id)
-    if not retrieved_chunks:
-        return ""
+    if not retrieved_chunks: return ""
     return "\n\n---\n\n".join(retrieved_chunks)
 
 # --- FastAPI Application Setup ---
@@ -224,9 +193,11 @@ async def generate_context_for_question(hyde_embedding: List[float], document_id
 app = FastAPI(title="LLM Query Retrieval System", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
+# Initialize services
 gemini_service = GeminiService(api_key=settings.google_api_key)
 pinecone_service = PineconeService(api_key=settings.pinecone_api_key, environment=settings.pinecone_environment, index_name=settings.pinecone_index_name)
 postgres_service = PostgresService()
+redis_client = redis.from_url(settings.redis_url, decode_responses=True)
 
 async def verify_token(authorization: str = Header(...)):
     if not authorization.startswith("Bearer "):
@@ -239,48 +210,47 @@ async def verify_token(authorization: str = Header(...)):
 @app.post("/api/v1/hackrx/run", response_model=HackRxResponse, dependencies=[Depends(verify_token)])
 async def hackrx_run(request: HackRxRequest):
     """
-    Handles the entire RAG pipeline in a single, performance-optimized request.
+    Handles the entire RAG pipeline with caching to ensure performance.
     """
     start_time = time.time()
+    document_id = hashlib.sha256(request.documents.encode()).hexdigest()
 
-    # --- Step 1: Document Ingestion ---
-    try:
-        ingestion_start = time.time()
-        document_text = await download_and_parse_pdf(request.documents)
-        if not document_text.strip():
-            raise HTTPException(status_code=500, detail="Extracted text from document is empty.")
-        
-        document_id = hashlib.sha256(request.documents.encode()).hexdigest()
-        text_chunks = sentence_aware_splitter(document_text)
-        print(f"OPTIMIZATION: Created {len(text_chunks)} chunks.")
-        
-        if not text_chunks:
-            raise HTTPException(status_code=500, detail="Could not extract text chunks from the document.")
+    # --- Step 1: Check Cache and Perform Ingestion if Necessary ---
+    is_cached = await redis_client.get(document_id)
+    if not is_cached:
+        print(f"CACHE MISS for document_id: {document_id}. Starting ingestion.")
+        try:
+            ingestion_start = time.time()
+            document_text = await download_and_parse_pdf(request.documents)
+            if not document_text.strip():
+                raise HTTPException(status_code=500, detail="Extracted text from document is empty.")
             
-        chunk_embeddings = await gemini_service.get_embeddings(text_chunks, task_type="retrieval_document")
-        await pinecone_service.upsert_documents(text_chunks, chunk_embeddings, namespace=document_id)
-        ingestion_time = time.time() - ingestion_start
-        print(f"Ingestion completed in {ingestion_time:.2f} seconds.")
-    except Exception as e:
-        print(f"Error during ingestion phase: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed during document ingestion: {e}")
+            text_chunks = sentence_aware_splitter(document_text)
+            if not text_chunks:
+                raise HTTPException(status_code=500, detail="Could not extract text chunks.")
+                
+            chunk_embeddings = await gemini_service.get_embeddings(text_chunks, task_type="retrieval_document")
+            await pinecone_service.upsert_documents(text_chunks, chunk_embeddings, namespace=document_id)
+            
+            # Set the cache key to indicate successful processing, with an expiration (e.g., 1 hour)
+            await redis_client.set(document_id, "processed", ex=3600)
+            
+            ingestion_time = time.time() - ingestion_start
+            print(f"Ingestion completed in {ingestion_time:.2f} seconds.")
+        except Exception as e:
+            print(f"Error during ingestion phase: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed during document ingestion: {e}")
+    else:
+        print(f"CACHE HIT for document_id: {document_id}. Skipping ingestion.")
 
     # --- Step 2: Batch-Optimized Question Answering ---
     answering_start = time.time()
     try:
-        # Step 2a: Generate all hypothetical answers in one batch
         hypothetical_answers = await gemini_service.generate_batch_hypothetical_answers(request.questions)
-        
-        # Step 2b: Embed all hypothetical answers in one batch
         hyde_embeddings = await gemini_service.get_embeddings(hypothetical_answers, task_type="retrieval_query")
-        
-        # Step 2c: Retrieve context for all questions concurrently
         context_tasks = [generate_context_for_question(emb, document_id) for emb in hyde_embeddings]
         contexts = await asyncio.gather(*context_tasks)
-        
-        # Step 2d: Generate all final answers in a single batch call
         answers = await gemini_service.generate_batch_final_answers(contexts, request.questions)
-
     except Exception as e:
         print(f"Error during answering phase: {e}")
         raise HTTPException(status_code=500, detail=f"Failed during question answering: {e}")
