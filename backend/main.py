@@ -1,5 +1,5 @@
 # main.py
-# Entry point for the FastAPI-based RAG system, with Redis caching for performance.
+# Entry point for the FastAPI-based RAG system, with Redis caching and batch processing.
 
 import os
 import httpx
@@ -31,8 +31,6 @@ class Settings(BaseSettings):
     db_name: str
     db_user: str
     db_password: str
-    # Add REDIS_URL to your .env file. For local dev, it can be "redis://localhost"
-    # For Render, you'll create a Redis instance and get a URL from them.
     redis_url: str = "redis://localhost"
     auth_token: str = "5ba298f10582e591e01dd5a437f580a8da1354f64898b2042fc74b9e0968f9d1"
 
@@ -61,42 +59,58 @@ class GeminiService:
         if not texts: return []
         print(f"Generating embeddings for {len(texts)} chunks for task: {task_type}...")
         try:
-            all_embeddings = []
-            for i in range(0, len(texts), 100):
-                batch_texts = texts[i:i+100]
-                result = genai.embed_content(model=self.embedding_model, content=batch_texts, task_type=task_type)
-                all_embeddings.extend(result['embedding'])
-            return all_embeddings
+            result = await asyncio.wait_for(
+                genai.embed_content_async(model=self.embedding_model, content=texts, task_type=task_type),
+                timeout=20.0
+            )
+            return result['embedding']
+        except asyncio.TimeoutError:
+            print("ERROR: Embedding generation timed out.")
+            raise HTTPException(status_code=504, detail="Embedding generation timed out.")
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to generate embeddings: {e}")
 
     async def generate_batch_hypothetical_answers(self, questions: List[str]) -> List[str]:
+        """Generates a batch of hypothetical answers from a list of questions in a single API call."""
         print(f"Generating batch of hypothetical answers for {len(questions)} questions...")
         formatted_questions = "\n".join([f"Q{i+1}: {q}" for i, q in enumerate(questions)])
         prompt = f"You are an expert in insurance policies. Based on the user's list of questions, generate a concise, hypothetical answer for each one. Return the result as a JSON object where keys are 'A1', 'A2', etc. User Questions:\n{formatted_questions}\n\nJSON Output:"
         try:
-            response = self.generation_model.generate_content(prompt)
+            response = await asyncio.wait_for(
+                self.generation_model.generate_content_async(prompt),
+                timeout=15.0
+            )
             cleaned_response = response.text.strip().replace("```json", "").replace("```", "").strip()
             answers_dict = json.loads(cleaned_response)
             hypothetical_answers = [answers_dict.get(f"A{i+1}", q) for i, q in enumerate(questions)]
             print(f"Generated {len(hypothetical_answers)} HyDEs in a batch.")
             return hypothetical_answers
+        except asyncio.TimeoutError:
+            print("ERROR: Hypothetical answer generation timed out. Falling back to original questions.")
+            return questions
         except Exception as e:
             print(f"Could not generate batch hypothetical answers. Error: {e}")
             return questions
 
     async def generate_batch_final_answers(self, contexts: List[str], questions: List[str]) -> List[str]:
+        """Generates the final, factual answers for a batch of questions in a single API call."""
         print(f"Generating batch of final answers for {len(questions)} questions...")
         combined_input = ""
         for i, (question, context) in enumerate(zip(questions, contexts)):
             combined_input += f"**Question {i+1}:** {question}\n**Context for Q{i+1}:**\n---\n{context if context else 'No context found.'}\n---\n\n"
         prompt = f"You are a specialized assistant. Answer a list of user questions based *exclusively* on the text provided for each question in the 'CONTEXT' section. If the context for a question is insufficient, you MUST respond with 'Cannot answer based on the provided information.' for that specific question. Return a single JSON object with keys 'A1', 'A2', etc. \n\n{combined_input}\n\nJSON Output:"
         try:
-            response = self.generation_model.generate_content(prompt)
+            response = await asyncio.wait_for(
+                self.generation_model.generate_content_async(prompt),
+                timeout=20.0
+            )
             cleaned_response = response.text.strip().replace("```json", "").replace("```", "").strip()
             answers_dict = json.loads(cleaned_response)
             final_answers = [answers_dict.get(f"A{i+1}", "Failed to generate an answer.") for i in range(len(questions))]
             return final_answers
+        except asyncio.TimeoutError:
+            print("ERROR: Final answer generation timed out.")
+            return ["The request timed out while generating a final answer." for _ in questions]
         except Exception as e:
             print(f"Could not generate batch final answers. Error: {e}")
             return ["Failed to generate an answer due to an error." for _ in questions]
@@ -210,7 +224,7 @@ async def verify_token(authorization: str = Header(...)):
 @app.post("/api/v1/hackrx/run", response_model=HackRxResponse, dependencies=[Depends(verify_token)])
 async def hackrx_run(request: HackRxRequest):
     """
-    Handles the entire RAG pipeline with caching to ensure performance.
+    Handles the entire RAG pipeline with caching and batch processing.
     """
     start_time = time.time()
     document_id = hashlib.sha256(request.documents.encode()).hexdigest()
@@ -232,7 +246,6 @@ async def hackrx_run(request: HackRxRequest):
             chunk_embeddings = await gemini_service.get_embeddings(text_chunks, task_type="retrieval_document")
             await pinecone_service.upsert_documents(text_chunks, chunk_embeddings, namespace=document_id)
             
-            # Set the cache key to indicate successful processing, with an expiration (e.g., 1 hour)
             await redis_client.set(document_id, "processed", ex=3600)
             
             ingestion_time = time.time() - ingestion_start
@@ -251,6 +264,7 @@ async def hackrx_run(request: HackRxRequest):
         context_tasks = [generate_context_for_question(emb, document_id) for emb in hyde_embeddings]
         contexts = await asyncio.gather(*context_tasks)
         answers = await gemini_service.generate_batch_final_answers(contexts, request.questions)
+
     except Exception as e:
         print(f"Error during answering phase: {e}")
         raise HTTPException(status_code=500, detail=f"Failed during question answering: {e}")
