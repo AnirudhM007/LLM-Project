@@ -1,5 +1,6 @@
 # main.py
 # Entry point for the FastAPI-based RAG system, with Redis caching for performance.
+# CORRECTED to strictly handle application/json and ENHANCED with robust parsing and detailed logging.
 
 import os
 import httpx
@@ -31,14 +32,12 @@ class Settings(BaseSettings):
     db_name: str
     db_user: str
     db_password: str
-    # Add REDIS_URL to your .env file. For local dev, it can be "redis://localhost"
-    # For Render, you'll create a Redis instance and get a URL from them.
     redis_url: str = "redis://localhost"
     auth_token: str = "5ba298f10582e591e01dd5a437f580a8da1354f64898b2042fc74b9e0968f9d1"
 
 settings = Settings()
 
-# --- API Models for Submission ---
+# --- API Models for Submission (as per specification) ---
 class HackRxRequest(BaseModel):
     documents: str = Field(..., description="URL to the PDF document to be processed.")
     questions: List[str] = Field(..., description="A list of questions to be answered based on the document.")
@@ -76,13 +75,22 @@ class GeminiService:
         prompt = f"You are an expert in insurance policies. Based on the user's list of questions, generate a concise, hypothetical answer for each one. Return the result as a JSON object where keys are 'A1', 'A2', etc. User Questions:\n{formatted_questions}\n\nJSON Output:"
         try:
             response = self.generation_model.generate_content(prompt)
-            cleaned_response = response.text.strip().replace("```json", "").replace("```", "").strip()
+            # IMPROVEMENT: More robust JSON cleaning and parsing
+            cleaned_response = response.text.strip()
+            if cleaned_response.startswith("```json"):
+                cleaned_response = cleaned_response[7:-3].strip()
+            elif cleaned_response.startswith("```"):
+                 cleaned_response = cleaned_response[3:-3].strip()
+
             answers_dict = json.loads(cleaned_response)
             hypothetical_answers = [answers_dict.get(f"A{i+1}", q) for i, q in enumerate(questions)]
             print(f"Generated {len(hypothetical_answers)} HyDEs in a batch.")
             return hypothetical_answers
+        except (json.JSONDecodeError, AttributeError, TypeError) as e:
+            print(f"Could not generate or parse batch hypothetical answers. Error: {e}. Falling back to using questions as HyDEs.")
+            return questions # Fallback to using original questions
         except Exception as e:
-            print(f"Could not generate batch hypothetical answers. Error: {e}")
+            print(f"An unexpected error occurred during HyDE generation. Error: {e}")
             return questions
 
     async def generate_batch_final_answers(self, contexts: List[str], questions: List[str]) -> List[str]:
@@ -93,13 +101,22 @@ class GeminiService:
         prompt = f"You are a specialized assistant. Answer a list of user questions based *exclusively* on the text provided for each question in the 'CONTEXT' section. If the context for a question is insufficient, you MUST respond with 'Cannot answer based on the provided information.' for that specific question. Return a single JSON object with keys 'A1', 'A2', etc. \n\n{combined_input}\n\nJSON Output:"
         try:
             response = self.generation_model.generate_content(prompt)
-            cleaned_response = response.text.strip().replace("```json", "").replace("```", "").strip()
+            # IMPROVEMENT: More robust JSON cleaning and parsing
+            cleaned_response = response.text.strip()
+            if cleaned_response.startswith("```json"):
+                cleaned_response = cleaned_response[7:-3].strip()
+            elif cleaned_response.startswith("```"):
+                 cleaned_response = cleaned_response[3:-3].strip()
+
             answers_dict = json.loads(cleaned_response)
             final_answers = [answers_dict.get(f"A{i+1}", "Failed to generate an answer.") for i in range(len(questions))]
             return final_answers
+        except (json.JSONDecodeError, AttributeError, TypeError) as e:
+            print(f"Could not generate or parse batch final answers. Error: {e}")
+            return ["Failed to generate a valid answer due to a parsing error." for _ in questions]
         except Exception as e:
-            print(f"Could not generate batch final answers. Error: {e}")
-            return ["Failed to generate an answer due to an error." for _ in questions]
+            print(f"An unexpected error occurred during final answer generation. Error: {e}")
+            return ["Failed to generate an answer due to an unexpected error." for _ in questions]
 
 
 class PineconeService:
@@ -155,6 +172,7 @@ class PostgresService:
 # --- Document Processing Utilities ---
 
 async def download_and_parse_pdf(url: str) -> str:
+    """Downloads and parses text from a PDF URL."""
     print(f"Downloading and parsing document from: {url}")
     try:
         async with httpx.AsyncClient() as client:
@@ -163,10 +181,9 @@ async def download_and_parse_pdf(url: str) -> str:
             pdf_file = io.BytesIO(response.content)
             reader = pypdf.PdfReader(pdf_file)
             text = " ".join(page.extract_text() or "" for page in reader.pages)
-            text = re.sub(r'\s+', ' ', text).strip()
-            return text
+            return re.sub(r'\s+', ' ', text).strip()
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to download document: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to download or parse document: {e}")
 
 def sentence_aware_splitter(text: str, chunk_size: int = 3000) -> List[str]:
     if not text: return []
@@ -205,14 +222,14 @@ async def verify_token(authorization: str = Header(...)):
     if authorization.split(" ")[1] != settings.auth_token:
         raise HTTPException(status_code=403, detail="Invalid token.")
 
-# --- API Endpoint for Submission ---
+# --- API Endpoint for Submission (Corrected for application/json) ---
 
 @app.post("/api/v1/hackrx/run", response_model=HackRxResponse, dependencies=[Depends(verify_token)])
 async def hackrx_run(request: HackRxRequest):
     """
-    Handles the entire RAG pipeline with caching to ensure performance.
+    Handles the entire RAG pipeline from a document URL, accepting an application/json request body.
     """
-    start_time = time.time()
+    full_request_start_time = time.time()
     document_id = hashlib.sha256(request.documents.encode()).hexdigest()
 
     # --- Step 1: Check Cache and Perform Ingestion if Necessary ---
@@ -232,7 +249,6 @@ async def hackrx_run(request: HackRxRequest):
             chunk_embeddings = await gemini_service.get_embeddings(text_chunks, task_type="retrieval_document")
             await pinecone_service.upsert_documents(text_chunks, chunk_embeddings, namespace=document_id)
             
-            # Set the cache key to indicate successful processing, with an expiration (e.g., 1 hour)
             await redis_client.set(document_id, "processed", ex=3600)
             
             ingestion_time = time.time() - ingestion_start
@@ -246,22 +262,35 @@ async def hackrx_run(request: HackRxRequest):
     # --- Step 2: Batch-Optimized Question Answering ---
     answering_start = time.time()
     try:
+        # IMPROVEMENT: Granular timing for each sub-step
+        hyde_start = time.time()
         hypothetical_answers = await gemini_service.generate_batch_hypothetical_answers(request.questions)
+        print(f" > HyDE generation took: {time.time() - hyde_start:.2f}s")
+
+        embedding_start = time.time()
         hyde_embeddings = await gemini_service.get_embeddings(hypothetical_answers, task_type="retrieval_query")
+        print(f" > HyDE embedding took: {time.time() - embedding_start:.2f}s")
+
+        retrieval_start = time.time()
         context_tasks = [generate_context_for_question(emb, document_id) for emb in hyde_embeddings]
         contexts = await asyncio.gather(*context_tasks)
+        print(f" > Context retrieval took: {time.time() - retrieval_start:.2f}s")
+
+        generation_start = time.time()
         answers = await gemini_service.generate_batch_final_answers(contexts, request.questions)
+        print(f" > Final answer generation took: {time.time() - generation_start:.2f}s")
+
     except Exception as e:
         print(f"Error during answering phase: {e}")
         raise HTTPException(status_code=500, detail=f"Failed during question answering: {e}")
     
     answering_time = time.time() - answering_start
-    print(f"Answering completed in {answering_time:.2f} seconds.")
+    print(f"Answering stage completed in {answering_time:.2f} seconds.")
     
     # --- Step 3: Logging and Response ---
     await postgres_service.log_interaction(request.documents, request.questions, answers)
     
-    total_time = time.time() - start_time
+    total_time = time.time() - full_request_start_time
     print(f"Full request completed in {total_time:.2f} seconds.")
 
     if total_time > 30:
