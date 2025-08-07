@@ -32,7 +32,7 @@ const App = () => {
 
     try {
       // Define the URL for your FastAPI backend endpoint.
-      const apiUrl = "https://valoretrieve.vercel.app/api/v1/hackrx/run";
+      const apiUrl = "http://localhost:8000/api/v1/hackrx/run";
 
       // Make the API call to your backend using fetch.
       const apiResponse = await fetch(apiUrl, {

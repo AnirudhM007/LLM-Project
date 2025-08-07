@@ -1,6 +1,6 @@
 # main.py
 # Entry point for the FastAPI-based RAG system, with Redis caching for performance.
-# CORRECTED to strictly handle application/json and ENHANCED with robust parsing and detailed logging.
+# UPGRADED with Multi-way Recall and Re-ranking for improved accuracy and speed.
 
 import os
 import httpx
@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
 import hashlib
 import re
 import json
@@ -37,7 +37,7 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
-# --- API Models for Submission (as per specification) ---
+# --- API Models for Submission ---
 class HackRxRequest(BaseModel):
     documents: str = Field(..., description="URL to the PDF document to be processed.")
     questions: List[str] = Field(..., description="A list of questions to be answered based on the document.")
@@ -75,7 +75,6 @@ class GeminiService:
         prompt = f"You are an expert in insurance policies. Based on the user's list of questions, generate a concise, hypothetical answer for each one. Return the result as a JSON object where keys are 'A1', 'A2', etc. User Questions:\n{formatted_questions}\n\nJSON Output:"
         try:
             response = self.generation_model.generate_content(prompt)
-            # IMPROVEMENT: More robust JSON cleaning and parsing
             cleaned_response = response.text.strip()
             if cleaned_response.startswith("```json"):
                 cleaned_response = cleaned_response[7:-3].strip()
@@ -88,7 +87,7 @@ class GeminiService:
             return hypothetical_answers
         except (json.JSONDecodeError, AttributeError, TypeError) as e:
             print(f"Could not generate or parse batch hypothetical answers. Error: {e}. Falling back to using questions as HyDEs.")
-            return questions # Fallback to using original questions
+            return questions
         except Exception as e:
             print(f"An unexpected error occurred during HyDE generation. Error: {e}")
             return questions
@@ -97,11 +96,11 @@ class GeminiService:
         print(f"Generating batch of final answers for {len(questions)} questions...")
         combined_input = ""
         for i, (question, context) in enumerate(zip(questions, contexts)):
+            # NEW: Context is now a single, top-ranked chunk.
             combined_input += f"**Question {i+1}:** {question}\n**Context for Q{i+1}:**\n---\n{context if context else 'No context found.'}\n---\n\n"
         prompt = f"You are a specialized assistant. Answer a list of user questions based *exclusively* on the text provided for each question in the 'CONTEXT' section. If the context for a question is insufficient, you MUST respond with 'Cannot answer based on the provided information.' for that specific question. Return a single JSON object with keys 'A1', 'A2', etc. \n\n{combined_input}\n\nJSON Output:"
         try:
             response = self.generation_model.generate_content(prompt)
-            # IMPROVEMENT: More robust JSON cleaning and parsing
             cleaned_response = response.text.strip()
             if cleaned_response.startswith("```json"):
                 cleaned_response = cleaned_response[7:-3].strip()
@@ -139,8 +138,8 @@ class PineconeService:
             self.index.upsert(vectors=batch, namespace=namespace)
         print("Upsert complete.")
 
-    async def query(self, query_embedding: List[float], top_k: int, namespace: str) -> List[str]:
-        print(f"Querying Pinecone namespace '{namespace}'...")
+    async def query_vector(self, query_embedding: List[float], top_k: int, namespace: str) -> List[str]:
+        print(f"Querying Pinecone namespace '{namespace}' with vector search...")
         result = self.index.query(namespace=namespace, vector=query_embedding, top_k=top_k, include_metadata=True)
         return [match['metadata']['text'] for match in result['matches']]
 
@@ -172,7 +171,6 @@ class PostgresService:
 # --- Document Processing Utilities ---
 
 async def download_and_parse_pdf(url: str) -> str:
-    """Downloads and parses text from a PDF URL."""
     print(f"Downloading and parsing document from: {url}")
     try:
         async with httpx.AsyncClient() as client:
@@ -199,11 +197,75 @@ def sentence_aware_splitter(text: str, chunk_size: int = 3000) -> List[str]:
         chunks.append(current_chunk.strip())
     return [c for c in chunks if c]
 
-# --- Core RAG Logic ---
-async def generate_context_for_question(hyde_embedding: List[float], document_id: str) -> str:
-    retrieved_chunks = await pinecone_service.query(hyde_embedding, top_k=6, namespace=document_id)
-    if not retrieved_chunks: return ""
-    return "\n\n---\n\n".join(retrieved_chunks)
+# --- NEW: Advanced RAG Core Logic ---
+
+def keyword_search(query: str, chunks: List[str], top_k: int = 5) -> List[str]:
+    """Performs a simple keyword search and returns top matching chunks."""
+    query_words = set(query.lower().split())
+    scores = []
+    for chunk in chunks:
+        chunk_words = set(chunk.lower().split())
+        score = len(query_words.intersection(chunk_words))
+        if score > 0:
+            scores.append((score, chunk))
+    
+    scores.sort(key=lambda x: x[0], reverse=True)
+    return [chunk for score, chunk in scores[:top_k]]
+
+def rerank_chunks(query: str, chunks: List[str]) -> str:
+    """
+    A simple re-ranking implementation. It prioritizes chunks that contain more of the query's keywords.
+    A more advanced version would use a dedicated cross-encoder model.
+    """
+    if not chunks:
+        return ""
+    
+    query_words = set(query.lower().split())
+    
+    best_chunk = ""
+    max_score = -1
+
+    # Use a set to avoid re-ranking duplicate chunks from keyword and vector searches
+    unique_chunks = list(set(chunks))
+
+    for chunk in unique_chunks:
+        chunk_words = set(chunk.lower().split())
+        score = len(query_words.intersection(chunk_words))
+        
+        # Simple boost for chunks that contain the full query phrase
+        if query.lower() in chunk.lower():
+            score += 5 
+
+        if score > max_score:
+            max_score = score
+            best_chunk = chunk
+            
+    return best_chunk
+
+async def get_context_for_questions(hyde_embeddings: List[List[float]], questions: List[str], document_id: str, all_chunks: List[str]) -> List[str]:
+    """
+    Implements Multi-way Recall and Re-ranking to find the best context for each question.
+    """
+    final_contexts = []
+    for i, (emb, question) in enumerate(zip(hyde_embeddings, questions)):
+        print(f"  > [Q{i+1}] Performing multi-way recall...")
+        # 1. Multi-way Recall
+        vector_results_task = pinecone_service.query_vector(emb, top_k=5, namespace=document_id)
+        keyword_results = keyword_search(question, all_chunks, top_k=5)
+        
+        vector_results = await vector_results_task
+        
+        # Combine results
+        combined_chunks = vector_results + keyword_results
+        print(f"  > [Q{i+1}] Found {len(vector_results)} vector results and {len(keyword_results)} keyword results.")
+
+        # 2. Re-rank
+        print(f"  > [Q{i+1}] Re-ranking {len(set(combined_chunks))} unique chunks...")
+        best_chunk = rerank_chunks(question, combined_chunks)
+        final_contexts.append(best_chunk)
+        print(f"  > [Q{i+1}] Top ranked chunk selected.")
+
+    return final_contexts
 
 # --- FastAPI Application Setup ---
 
@@ -222,19 +284,21 @@ async def verify_token(authorization: str = Header(...)):
     if authorization.split(" ")[1] != settings.auth_token:
         raise HTTPException(status_code=403, detail="Invalid token.")
 
-# --- API Endpoint for Submission (Corrected for application/json) ---
+# --- API Endpoint for Submission ---
 
 @app.post("/api/v1/hackrx/run", response_model=HackRxResponse, dependencies=[Depends(verify_token)])
 async def hackrx_run(request: HackRxRequest):
-    """
-    Handles the entire RAG pipeline from a document URL, accepting an application/json request body.
-    """
     full_request_start_time = time.time()
     document_id = hashlib.sha256(request.documents.encode()).hexdigest()
 
     # --- Step 1: Check Cache and Perform Ingestion if Necessary ---
-    is_cached = await redis_client.get(document_id)
-    if not is_cached:
+    # NEW: We now cache the full text chunks in Redis as well.
+    cached_chunks_json = await redis_client.get(f"{document_id}_chunks")
+    
+    if cached_chunks_json:
+        print(f"CACHE HIT for document_id: {document_id}. Skipping ingestion.")
+        text_chunks = json.loads(cached_chunks_json)
+    else:
         print(f"CACHE MISS for document_id: {document_id}. Starting ingestion.")
         try:
             ingestion_start = time.time()
@@ -249,20 +313,18 @@ async def hackrx_run(request: HackRxRequest):
             chunk_embeddings = await gemini_service.get_embeddings(text_chunks, task_type="retrieval_document")
             await pinecone_service.upsert_documents(text_chunks, chunk_embeddings, namespace=document_id)
             
-            await redis_client.set(document_id, "processed", ex=3600)
+            # Cache the text chunks for keyword search and re-ranking
+            await redis_client.set(f"{document_id}_chunks", json.dumps(text_chunks), ex=3600)
             
             ingestion_time = time.time() - ingestion_start
             print(f"Ingestion completed in {ingestion_time:.2f} seconds.")
         except Exception as e:
             print(f"Error during ingestion phase: {e}")
             raise HTTPException(status_code=500, detail=f"Failed during document ingestion: {e}")
-    else:
-        print(f"CACHE HIT for document_id: {document_id}. Skipping ingestion.")
 
-    # --- Step 2: Batch-Optimized Question Answering ---
+    # --- Step 2: Batch-Optimized Question Answering with Advanced RAG ---
     answering_start = time.time()
     try:
-        # IMPROVEMENT: Granular timing for each sub-step
         hyde_start = time.time()
         hypothetical_answers = await gemini_service.generate_batch_hypothetical_answers(request.questions)
         print(f" > HyDE generation took: {time.time() - hyde_start:.2f}s")
@@ -272,9 +334,9 @@ async def hackrx_run(request: HackRxRequest):
         print(f" > HyDE embedding took: {time.time() - embedding_start:.2f}s")
 
         retrieval_start = time.time()
-        context_tasks = [generate_context_for_question(emb, document_id) for emb in hyde_embeddings]
-        contexts = await asyncio.gather(*context_tasks)
-        print(f" > Context retrieval took: {time.time() - retrieval_start:.2f}s")
+        # NEW: Call the advanced context retrieval function
+        contexts = await get_context_for_questions(hyde_embeddings, request.questions, document_id, text_chunks)
+        print(f" > Context retrieval & re-ranking took: {time.time() - retrieval_start:.2f}s")
 
         generation_start = time.time()
         answers = await gemini_service.generate_batch_final_answers(contexts, request.questions)
